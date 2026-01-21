@@ -6,7 +6,10 @@
 
 ### 1.1 算法核心逻辑：显式反馈矩阵分解
 我们的目标是预测用户 $u$ 对物品 $i$ 的评分 $\hat{r}_{ui}$。传统的矩阵分解预测公式为：
-$$ \hat{r}_{ui} = \mu + b_u + b_i + \mathbf{p}_u \cdot \mathbf{q}_i^T $$
+
+$$
+\hat{r}_{ui} = \mu + b_u + b_i + \mathbf{p}_u \cdot \mathbf{q}_i^T
+$$
 
 其中：
 - $\mu$: 全局平均分 (Global Mean)
@@ -22,7 +25,11 @@ $$ \hat{r}_{ui} = \mu + b_u + b_i + \mathbf{p}_u \cdot \mathbf{q}_i^T $$
 #### A. 统计收缩 (Statistical Shrinkage) 预计算 Bias
 在迭代开始前，不让模型去"学习" $b_u$ 和 $b_i$（这会增加参数量导致过拟合），而是直接通过统计方法**预计算**并固定下来。
 使用了正则化收缩公式：
-$$ b_u = \frac{\sum (r_{ui} - \mu)}{N_u + \lambda_{bias}} $$
+
+$$
+b_u = \frac{\sum (r_{ui} - \mu)}{N_u + \lambda_{bias}}
+$$
+
 其中 $\lambda_{bias}=10$ (`BIAS_REG`)。这意味着如果一个用户评分很少，他的偏差会趋向于0（不敢断定他偏好严苛还是宽松），只有评分数据足够多时，$b_u$ 才会显著。
 *代码位置*: `train_with_monitoring` 函数中的 "Pre-calculating Biases" 部分。
 
