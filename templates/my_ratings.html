@@ -26,7 +26,7 @@
             <h1 class="text-3xl font-bold tracking-tight">🎬 MovieRec</h1>
             <div class="space-x-4 flex items-center">
                 <a href="/" class="bg-white bg-opacity-20 hover:bg-opacity-30 px-4 py-2 rounded-lg transition font-semibold">← Back to Home</a>
-                <button onclick="location.reload()" class="bg-red-500 hover:bg-red-600 px-4 py-2 rounded-lg text-sm font-semibold transition shadow-lg">Logout</button>
+                <button onclick="handleLogout()" class="bg-red-500 hover:bg-red-600 px-4 py-2 rounded-lg text-sm font-semibold transition shadow-lg">Logout</button>
             </div>
         </div>
     </nav>
@@ -57,6 +57,11 @@
     </div>
 
     <script>
+        async function handleLogout() {
+            await fetch('/api/logout', { method: 'POST' });
+            window.location.href = '/';
+        }
+
         async function loadMyRatings() {
             const resp = await fetch('/api/my-ratings');
             if (resp.status === 401) {
