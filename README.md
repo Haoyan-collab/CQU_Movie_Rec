@@ -40,19 +40,206 @@ $$ \text{Target} = r_{ui} - \mu - b_u - b_i $$
 *代码位置*: `solve_batch_residual` 函数。
 
 ### 1.3 分布式计算 (Spark RDD) 实现
-代码没有使用 Spark MLlib 的现成库，而是**手写了并行算子**，以便完全控制优化细节。
+代码没有使用 Spark MLlib 的现成库，而是**手写了并行算子**，以便完全控制优化细节。这使得我们能够精确实现上述的统计收缩和残差拟合优化。
 
-1.  **数据分区 (Partitioning)**:
-    - `user_data` 和 `item_data` 分别按照 UserID 和 MovieID 进行 `groupByKey`。
-    - 这样可以将同一个用户的所有评分数据汇聚到同一个计算节点上，方便一次性算出该用户的向量 $\mathbf{p}_u$。
+#### 分布式训练架构详解
 
-2.  **广播变量 (Broadcast Variables)**:
-    - ALS 是交替优化的：固定 Q 算 P，然后固定 P 算 Q。
-    - 在算 P 时，矩阵 Q 是固定的。代码将 Q 矩阵通过 `sc.broadcast(Q)` 广播到所有工作节点，大大减少了网络传输开销。
+**核心思想**: 利用 Apache Spark 的 RDD (Resilient Distributed Dataset) 弹性分布式数据集，将矩阵分解中的大规模线性代数运算并行化到多个计算节点上。
 
-3.  **并行求解 (Parallel Solve)**:
-    - 使用 `mapPartitions` 在每个分区内并行运行 `solve_batch_residual`。
-    - 内部利用 `numpy.linalg.solve` 求解最小二乘问题 ($X^TX + \lambda I)^{-1} X^TY$。
+##### A. 数据分区策略 (Partitioning Strategy)
+
+在 ALS 算法中，更新用户向量 $\mathbf{p}_u$ 时需要该用户的所有评分记录，更新物品向量 $\mathbf{q}_i$ 时需要该物品的所有评分记录。因此我们采用**按 ID 聚合分区**的策略：
+
+```python
+# 用户维度分区：将同一用户的所有评分聚合到一起
+user_data = train_rdd.map(lambda x: (x[0], (x[1], x[2]))) \
+                     .groupByKey() \
+                     .mapValues(list)
+# 结果: (user_idx, [(item_1, rating_1), (item_2, rating_2), ...])
+
+# 物品维度分区：将同一物品的所有评分聚合到一起  
+item_data = train_rdd.map(lambda x: (x[1], (x[0], x[2]))) \
+                     .groupByKey() \
+                     .mapValues(list)
+# 结果: (item_idx, [(user_1, rating_1), (user_2, rating_2), ...])
+```
+
+通过 `groupByKey()` 操作，Spark 会自动进行 **Shuffle (数据重分布)**，确保相同 Key 的数据被路由到同一个分区 (Partition)。每个分区可以独立地在一个 Executor (计算节点) 上并行处理。
+
+**分区数量控制**: 通过 `.repartition(PARALLELISM)` 设定为 8 个分区，平衡了并行度和通信开销。
+
+##### B. 广播变量优化 (Broadcast Variables)
+
+ALS 是**交替优化**算法：
+- **Step 1**: 固定物品矩阵 Q，更新用户矩阵 P
+- **Step 2**: 固定用户矩阵 P，更新物品矩阵 Q
+
+在 Step 1 中，所有 Executor 都需要读取完整的 Q 矩阵。如果不做优化，每个 Task 都会通过网络从 Driver 拉取 Q，造成巨大的网络开销。
+
+**广播机制**:
+```python
+Q_bd = sc.broadcast(Q)  # 将 Q 矩阵广播到所有节点
+# Spark 会使用高效的 P2P 协议 (BitTorrent-like) 分发数据
+# 每个 Executor 只需下载一次，然后缓存在本地内存
+```
+
+广播变量的优势：
+- **网络传输优化**: 从 O(tasks × data_size) 降低到 O(executors × data_size)
+- **内存共享**: 同一 Executor 上的多个 Task 共享同一份广播数据
+- **只读语义**: 保证数据一致性
+
+类似地，我们也广播了 Bias 数组 (`B_u`, `B_i`) 和全局均值 (`global_mean`)。
+
+##### C. 并行求解 (Parallel Least Squares Solve)
+
+核心计算逻辑封装在 `solve_batch_residual` 函数中，通过 `mapPartitions` 算子实现分区级并行：
+
+```python
+res_u = user_data.mapPartitions(
+    lambda it: solve_batch_residual(it, Q_bd, Bi_bd, Bu_bd, 
+                                    global_mean, RANK, LAMBDA_REG)
+).collect()
+```
+
+**执行流程**:
+1. **分发任务**: Spark 将 `user_data` 的每个分区分配给不同的 Executor
+2. **本地计算**: 每个 Executor 独立地对分区内的所有用户求解最小二乘问题
+   - 对于用户 $u$，构建目标向量 $Y = r_{ui} - \mu - b_u - b_i$（残差）
+   - 构建设计矩阵 $X$ (对应物品的隐向量 $\mathbf{q}_i$)
+   - 求解正规方程: $(X^TX + \lambda I) \mathbf{p}_u = X^T Y$
+   - 使用 NumPy 的 `linalg.solve` 高效求解（利用 BLAS/LAPACK 加速）
+3. **结果收集**: `.collect()` 将所有分区的计算结果汇总回 Driver
+4. **更新矩阵**: 在 Driver 端更新 P 矩阵
+
+**为什么用 `mapPartitions` 而不是 `map`**:
+- `map` 是逐条记录处理，每条记录都会调用一次函数
+- `mapPartitions` 是批量处理整个分区，可以复用计算资源（如预计算的正则化矩阵 $\lambda I$）
+- 减少了函数调用开销和序列化开销
+
+##### D. 内存管理与持久化
+
+```python
+train_rdd.persist(StorageLevel.MEMORY_AND_DISK)
+user_data.persist(StorageLevel.MEMORY_AND_DISK)
+```
+
+使用 `.persist()` 将中间结果缓存：
+- **MEMORY_AND_DISK**: 优先存内存，内存不足时溢出到磁盘
+- 避免重复计算 (Spark 的 RDD 默认是惰性求值)
+- 在迭代算法中尤为重要（ALS 需要 20 次迭代）
+
+**显式释放**:
+```python
+Q_bd.unpersist()  # 每次迭代后释放旧的广播变量
+```
+防止内存泄漏，因为每次迭代 Q 都会更新，旧的广播变量不再需要。
+
+##### E. 容错机制
+
+Spark RDD 的 **Lineage (血统)** 机制提供了自动容错：
+- 每个 RDD 都记录了它的计算依赖关系
+- 如果某个分区的数据丢失（节点故障），Spark 可以根据 Lineage 自动重新计算
+- 在我们的代码中，通过 `.persist()` 缓存了关键的中间结果，减少了失败后的恢复开销
+
+---
+
+### 1.4 模型增量更新与重训练 (`retrain_from_db.py`)
+
+#### 问题背景
+在生产环境中，用户会持续产生新的评分数据，这些数据被实时写入 MongoDB 数据库。但是，推荐引擎使用的是**静态的** `model_final.pkl` 文件，无法自动吸收新数据。这导致：
+
+1. **新用户冷启动**: 新注册用户的 `inner_idx = -1`，只能获得非个性化的热度榜推荐
+2. **老用户偏好漂移**: 即使老用户的口味发生变化，推荐结果也不会更新
+3. **新电影推荐滞后**: 新增电影无法进入推荐池
+
+#### 解决方案：重训练脚本
+
+`retrain_from_db.py` 是一个独立的模型更新脚本，它能够：
+
+**核心功能**:
+1. **从 MongoDB 提取评分数据** - 连接数据库，读取 `ratings` 集合中的所有评分记录
+2. **与原始 CSV 数据合并** - 将数据库中的新评分与 MovieLens 原始数据集合并
+   - 对于同一 (用户, 电影) 对，**数据库数据优先**（用户可能修改了评分）
+   - 使用 Pandas 的 `drop_duplicates(keep='last')` 实现
+3. **完整重训练** - 调用与 `train.py` 完全相同的 ALS 训练逻辑
+4. **更新模型文件** - 将新模型覆盖写入 `model_final.pkl`
+
+**使用方式**:
+```bash
+# 标准模式：合并 CSV + MongoDB 数据后重训练
+python retrain_from_db.py
+
+# 仅使用数据库数据（忽略原始 CSV）
+python retrain_from_db.py --db-only
+
+# 指定输出文件名（用于 A/B 测试）
+python retrain_from_db.py --output model_v2.pkl
+
+# 指定 CSV 路径
+python retrain_from_db.py --csv-path data/ml-latest-small/ratings.csv
+```
+
+#### 数据合并策略
+
+```python
+def merge_ratings_data(csv_path, use_db_only=False):
+    db_df = extract_ratings_from_db()  # 从 MongoDB 提取
+    
+    if not use_db_only:
+        csv_df = pd.read_csv(csv_path)  # 加载原始数据
+        combined_df = pd.concat([csv_df, db_df], ignore_index=True)
+        # 去重：对于相同的 (userId, movieId)，保留最后出现的记录
+        combined_df = combined_df.drop_duplicates(
+            subset=['userId', 'movieId'], keep='last'
+        )
+    else:
+        combined_df = db_df
+    
+    return combined_df
+```
+
+**去重逻辑**: `keep='last'` 确保数据库中的评分会覆盖 CSV 中的旧评分，符合"用户最新行为优先"的原则。
+
+#### 训练一致性保证
+
+`retrain_from_db.py` 与 `train.py` 在训练逻辑上**完全一致**：
+- ✅ 相同的超参数 (RANK=20, LAMBDA_REG=0.1, BIAS_REG=10)
+- ✅ 相同的预计算 Bias 逻辑（统计收缩）
+- ✅ 相同的残差拟合求解器 (`solve_batch_residual`)
+- ✅ 相同的分布式计算策略（Spark RDD + 广播变量）
+
+唯一的区别是**数据来源**：
+- `train.py`: 直接从 CSV 文件读取
+- `retrain_from_db.py`: 从 MongoDB 提取并与 CSV 合并
+
+#### 生产部署建议
+
+**更新频率**:
+- **低频更新** (推荐): 每天凌晨定时重训练（使用 cron 或 Task Scheduler）
+  ```bash
+  # Linux Cron 示例
+  0 2 * * * cd /path/to/project && python retrain_from_db.py
+  ```
+- **中频更新**: 每当新增评分达到一定阈值（如 1000 条）时触发
+- **高频更新** (不推荐): 实时重训练会占用大量计算资源
+
+**平滑切换**:
+1. 重训练时先输出到 `model_new.pkl`
+2. 验证新模型的 RMSE/MAE 指标
+3. 如果指标正常，原子性地重命名文件（`mv model_new.pkl model_final.pkl`）
+4. Flask 应用检测到文件更新后，重新加载模型（可以添加文件监听或使用信号量）
+
+**新用户处理**:
+重训练后，新用户会被分配 `inner_idx`，从"冷启动用户"升级为"个性化推荐用户"。需要更新数据库：
+```python
+# 训练完成后，更新 MongoDB 中的 inner_idx
+for raw_uid, inner_idx in u_map.items():
+    db.users.update_one(
+        {"userId": raw_uid},
+        {"$set": {"inner_idx": inner_idx, "is_new": False}}
+    )
+```
+*(注: 当前脚本尚未实现此步骤，建议在 `init_db.py` 或单独的同步脚本中完成)*
 
 ---
 
@@ -156,4 +343,14 @@ $$ \text{Target} = r_{ui} - \mu - b_u - b_i $$
     ```bash
     python app.py
     # 访问 http://127.0.0.1:5000
+    ```
+
+4.  **模型更新** (生产环境定期执行):
+    ```bash
+    # 用户产生新评分后，定期重训练模型以更新推荐
+    python retrain_from_db.py
+    # 合并 MongoDB 和 CSV 数据，重新训练并覆盖 model_final.pkl
+    
+    # 重启 Flask 应用以加载新模型
+    # (或实现热加载机制)
     ```
