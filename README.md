@@ -34,8 +34,10 @@ $$
 *代码位置*: `train_with_monitoring` 函数中的 "Pre-calculating Biases" 部分。
 
 #### B. 残差拟合 (Residual Fitting)
-在 ALS 迭代求解 $\mathbf{p}_u$ 和 $\mathbf{q}_i$ 时，我们不是由零开始拟合，而是拟合**残差**。
-$$ \text{Target} = r_{ui} - \mu - b_u - b_i $$
+在 ALS 迭代求解 $\mathbf{p}_u$ 和 $\mathbf{q}_i$ 时，我们不是由零开始拟合，而是拟合**残差**：
+$$ 
+\text{Target} = r_{ui} - \mu - b_u - b_i 
+$$
 模型的任务简化为：让 $\mathbf{p}_u \cdot \mathbf{q}_i^T$ 尽可能接近这个“去除了平均效应和偏差效应”后的残差。这大大降低了隐向量的学习难度，提高了泛化能力。
 *代码位置*: `solve_batch_residual` 函数。
 
